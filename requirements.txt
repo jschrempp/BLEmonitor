@@ -1,0 +1,11 @@
+# BLE Monitor Python Requirements
+# Install with: pip3 install -r requirements.txt
+
+# BLE scanning library (cross-platform)
+bleak>=0.21.0
+
+# MySQL database connector
+mysql-connector-python>=8.0.33
+
+# For report formatting
+tabulate>=0.9.0

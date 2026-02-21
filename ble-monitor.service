@@ -1,0 +1,23 @@
+[Unit]
+Description=BLE Monitor Service
+After=network.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/ble_monitor
+Environment="PATH=/home/pi/ble_monitor/venv/bin"
+ExecStart=/home/pi/ble_monitor/venv/bin/python3 /home/pi/ble_monitor/ble_monitor.py
+Restart=always
+RestartSec=60
+StandardOutput=append:/home/pi/ble_monitor/ble_monitor.log
+StandardError=append:/home/pi/ble_monitor/ble_monitor.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

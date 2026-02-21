@@ -1,0 +1,29 @@
+# BLE Monitor Configuration File
+# Copy this to config.ini and customize for your setup
+
+[monitor]
+# Unique name for this monitor (used to identify it in the database)
+name = RPi_Monitor_01
+
+# Physical location of this monitor
+location = Living Room
+
+# Optional description
+description = Raspberry Pi 4 BLE Monitor
+
+# Scan interval in seconds (300 = 5 minutes)
+scan_interval_seconds = 300
+
+# Duration of each BLE scan in seconds
+scan_duration_seconds = 10
+
+# Logging level: DEBUG, INFO, WARNING, ERROR
+log_level = INFO
+
+[database]
+# MySQL database connection settings
+host = localhost
+port = 3306
+user = ble_user
+password = change_this_password
+database = ble_monitor
