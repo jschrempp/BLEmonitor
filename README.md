@@ -14,17 +14,124 @@ A comprehensive Raspberry Pi application for monitoring Bluetooth Low Energy (BL
 
 ## System Architecture
 
+### How the Monitor Works
+
+The BLE Monitor application (`ble_monitor.py`) continuously scans for Bluetooth Low Energy devices and intelligently stores them in a MySQL database with automatic deduplication across multiple monitors.
+
+**Monitor Operation Flow:**
+
+1. **Initialization**: Monitor registers itself in the database with name, location, and status
+2. **Scan Cycle**: Every 5 minutes (configurable), performs a BLE scan for 10 seconds (configurable)
+3. **Data Collection**: Captures MAC address, device name, and RSSI (signal strength) for each device
+4. **Staging**: Writes all readings to the `sighting_staging` table with interval timestamp
+5. **Processing**: Automatically selects the best RSSI reading per device per interval
+6. **Storage**: Writes deduplicated data to the final `device_sightings` table
+7. **Repeat**: Sleeps until the next interval and repeats
+
+**Key Features:**
+- **Automatic retry**: Recovers from database connection errors
+- **Graceful shutdown**: Handles CTRL+C and systemd stop signals
+- **Detailed logging**: Logs all operations to both file and console
+- **Simulation mode**: Can run without BLE hardware for testing
+
 ### Database Schema
+
 - **monitors**: Tracks each monitoring device with location and status
-- **ble_devices**: Catalog of discovered BLE devices
+- **ble_devices**: Catalog of discovered BLE devices (MAC addresses and names)
 - **device_sightings**: Final sightings with best RSSI per interval
 - **sighting_staging**: Temporary storage for all readings before selecting best RSSI
 
-### Best RSSI Selection Logic
-1. Each monitor scans for BLE devices and stores readings in the staging table
-2. At the end of each 5-minute interval, the system processes staged data
-3. For each device, only the reading with the highest RSSI (least negative) is kept
-4. This ensures only the closest/strongest monitor's reading is logged per interval
+### Best RSSI Selection Logic (Multi-Monitor Coordination)
+
+When multiple monitors detect the same device during a 5-minute interval, the system automatically selects the best reading:
+
+1. **Each monitor scans independently**: All monitors scan for BLE devices at their configured intervals
+2. **Staging table collects all readings**: Each monitor writes its findings to `sighting_staging` with:
+   - MAC address and device name
+   - Monitor ID
+   - RSSI value
+   - Interval start timestamp (5-minute boundary)
+3. **Best RSSI selection**: After writing to staging, the monitor calls stored procedure `process_interval_best_rssi()` which:
+   - Groups all readings by device and interval
+   - Selects the reading with the highest RSSI (least negative = strongest signal)
+   - Inserts the best reading into `device_sightings`
+   - Marks staged records as processed
+4. **Result**: Only one record per device per 5-minute interval in the final table, from the monitor with the best signal
+
+**Example:**
+- Monitor "Living Room" sees device AA:BB:CC:DD:EE:FF with RSSI -65
+- Monitor "Kitchen" sees same device with RSSI -72
+- Only the Living Room reading (-65) is stored in `device_sightings`
+
+This ensures accurate location tracking (closest monitor) and prevents duplicate data.
+
+### Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BLE Monitor Application                       │
+│                    (ble_monitor.py)                              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  1. Initialize & Register Monitor        │
+        │     - Connect to database                │
+        │     - Create/update monitor record       │
+        │     - Get monitor_id                     │
+        └─────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  2. Calculate 5-Minute Interval Start    │
+        │     (e.g., 14:35:00, 14:40:00)          │
+        └─────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  3. Scan for BLE Devices (10 seconds)   │
+        │     - Discover nearby BLE devices        │
+        │     - Collect MAC, name, RSSI            │
+        └─────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  4. Write to Staging Table               │
+        │     INSERT INTO sighting_staging         │
+        │     (All readings from this monitor)     │
+        └─────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  5. Ensure Devices Exist                 │
+        │     INSERT INTO ble_devices              │
+        │     ON DUPLICATE KEY UPDATE              │
+        └─────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  6. Process Best RSSI Selection          │
+        │     CALL process_interval_best_rssi()    │
+        │     - Group by device + interval         │
+        │     - SELECT MAX(rssi)                   │
+        │     - INSERT INTO device_sightings       │
+        │     - Mark staging records as processed  │
+        └─────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │  7. Sleep Until Next Interval            │
+        │     (300 seconds - scan duration)        │
+        └─────────────────────────────────────────┘
+                              │
+                              └──────► Loop back to step 2
+```
+
+**Database Tables Interaction:**
+- `monitors` ← Monitor registers/updates itself
+- `sighting_staging` ← Raw scan data from all monitors
+- `ble_devices` ← Device catalog (auto-created)
+- `device_sightings` ← Final deduplicated data (best RSSI)
 
 ## Requirements
 
@@ -128,6 +235,10 @@ database = ble_monitor
 Run a single scan to verify everything works:
 
 ```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Run a single test scan
 python3 ble_monitor.py --single
 ```
 
@@ -136,7 +247,45 @@ Check the logs:
 tail -f ble_monitor.log
 ```
 
+You should see output like:
+```
+2026-02-22 15:30:18 - BLEMonitor - INFO - Running single scan mode
+2026-02-22 15:30:18 - BLEMonitor - INFO - Monitor registered: RPi_Monitor_01 (ID: 1)
+2026-02-22 15:30:18 - BLEMonitor - INFO - Starting scan cycle for interval: 2026-02-22 15:30:00
+2026-02-22 15:30:18 - BLEMonitor - INFO - Starting BLE scan for 10 seconds...
+2026-02-22 15:30:28 - BLEMonitor - INFO - Scan complete. Found 47 devices
+2026-02-22 15:30:28 - BLEMonitor - INFO - Stored 47 sightings in staging for interval 2026-02-22 15:30:00
+2026-02-22 15:30:28 - BLEMonitor - INFO - Processed interval 2026-02-22 15:30:00 - selected best RSSI per device
+2026-02-22 15:30:28 - BLEMonitor - INFO - Single scan complete
+```
+
 ## Running the Monitor
+
+### Command-Line Options
+
+```bash
+python3 ble_monitor.py [options]
+
+Options:
+  -c, --config FILE    Configuration file path (default: config.ini)
+  --single             Run single scan and exit (for testing)
+  -h, --help          Show help message
+```
+
+**Examples:**
+```bash
+# Continuous monitoring (runs forever)
+python3 ble_monitor.py
+
+# Single scan test
+python3 ble_monitor.py --single
+
+# Use alternate config file
+python3 ble_monitor.py -c /path/to/custom_config.ini
+
+# Test with custom config
+python3 ble_monitor.py -c test_config.ini --single
+```
 
 ### Start Manually
 
@@ -144,12 +293,18 @@ tail -f ble_monitor.log
 # Activate virtual environment
 source venv/bin/activate
 
-# Run continuously
+# Run continuously (press CTRL+C to stop)
 python3 ble_monitor.py
 
-# Or run single scan for testing
-python3 ble_monitor.py --single
+# Monitor logs in another terminal
+tail -f ble_monitor.log
 ```
+
+**What happens in continuous mode:**
+- Scans every 5 minutes (or configured interval)
+- Automatically reconnects if database connection is lost
+- Logs all operations to `ble_monitor.log` and console
+- Handles CTRL+C gracefully for shutdown
 
 ### Run as a System Service
 
@@ -191,6 +346,86 @@ Check service status:
 ```bash
 sudo systemctl status ble-monitor.service
 sudo journalctl -u ble-monitor.service -f
+```
+
+## Monitoring Monitor Health
+
+### Check if Monitor is Running and Active
+
+```bash
+# Check service status
+sudo systemctl status ble-monitor.service
+
+# View recent log entries
+tail -n 50 ble_monitor.log
+
+# Check when monitor last reported
+mysql -u ble_user -p ble_monitor -e "
+SELECT 
+    monitor_name, 
+    location, 
+    last_seen,
+    TIMESTAMPDIFF(MINUTE, last_seen, NOW()) as minutes_ago,
+    is_active
+FROM monitors;"
+```
+
+### Verify Data is Being Written
+
+```bash
+# Check recent sightings
+mysql -u ble_user -p ble_monitor -e "
+SELECT COUNT(*) as recent_sightings
+FROM device_sightings 
+WHERE sighting_timestamp >= DATE_SUB(NOW(), INTERVAL 1 HOUR);"
+
+# Check staging table status
+mysql -u ble_user -p ble_monitor -e "
+SELECT processed, COUNT(*) as count 
+FROM sighting_staging 
+GROUP BY processed;"
+
+# View most recent scan data
+mysql -u ble_user -p ble_monitor -e "
+SELECT * FROM device_sightings 
+ORDER BY sighting_timestamp DESC 
+LIMIT 10;"
+```
+
+### Monitor Performance Metrics
+
+```sql
+-- Average devices per scan (last 24 hours)
+SELECT 
+    m.monitor_name,
+    COUNT(DISTINCT ds.device_id) / COUNT(DISTINCT ds.interval_start) as avg_devices_per_scan,
+    COUNT(*) as total_sightings
+FROM device_sightings ds
+JOIN monitors m ON ds.monitor_id = m.monitor_id
+WHERE ds.sighting_timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+GROUP BY m.monitor_id;
+
+-- Check for gaps in monitoring
+SELECT 
+    interval_start,
+    COUNT(DISTINCT monitor_id) as monitor_count,
+    COUNT(*) as device_count
+FROM device_sightings 
+WHERE interval_start >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+GROUP BY interval_start
+ORDER BY interval_start DESC;
+```
+
+### Dashboard for Real-Time Monitoring
+
+Use the included dashboard for live monitoring:
+
+```bash
+# Run live dashboard (refreshes every 30 seconds)
+python3 dashboard.py
+
+# Or run once and exit
+python3 dashboard.py --once
 ```
 
 ## Generating Reports
@@ -295,6 +530,90 @@ WHERE interval_start < DATE_SUB(NOW(), INTERVAL 90 DAY);
 
 ## Troubleshooting
 
+### Monitor and Database Writer Issues
+
+**Problem: Monitor fails to start**
+```bash
+# Check config file exists and is readable
+cat config.ini
+
+# Verify database connection settings
+python3 test_db.py
+
+# Check Python dependencies
+pip3 list | grep -E "bleak|mysql-connector"
+```
+
+**Problem: "No devices found" in logs**
+```bash
+# Verify Bluetooth is working
+sudo hciconfig
+sudo hcitool lescan
+
+# Check BLE adapter is up
+sudo hciconfig hci0 up
+
+# Try increasing scan duration in config.ini
+scan_duration_seconds = 15
+```
+
+**Problem: Database connection errors**
+```bash
+# Verify database exists
+mysql -u ble_user -p -e "SHOW DATABASES;"
+
+# Check if stored procedures exist
+mysql -u ble_user -p ble_monitor -e "SHOW PROCEDURE STATUS WHERE Db = 'ble_monitor';"
+
+# Recreate schema if needed
+mysql -u ble_user -p ble_monitor < schema.sql
+```
+
+**Problem: Staging table filling up**
+```sql
+-- Check staging table size
+SELECT COUNT(*), processed FROM sighting_staging GROUP BY processed;
+
+-- Clean up processed staging records
+CALL cleanup_old_staging(1);
+
+-- Check for unprocessed records stuck
+SELECT interval_start, COUNT(*) 
+FROM sighting_staging 
+WHERE processed = FALSE 
+GROUP BY interval_start 
+ORDER BY interval_start DESC;
+```
+
+**Problem: Duplicate device records in same interval**
+```sql
+-- Check for duplicates (should return 0)
+SELECT device_id, interval_start, COUNT(*) as count
+FROM device_sightings
+GROUP BY device_id, interval_start
+HAVING count > 1;
+
+-- If duplicates exist, the stored procedure may not be running
+-- Verify it exists:
+SHOW CREATE PROCEDURE process_interval_best_rssi;
+```
+
+**Problem: Monitor stops responding**
+```bash
+# Check if process is running
+ps aux | grep ble_monitor.py
+
+# Check system resources
+free -h
+df -h
+
+# Check for errors in log
+tail -n 100 ble_monitor.log | grep ERROR
+
+# Restart the monitor
+sudo systemctl restart ble-monitor.service
+```
+
 ### BLE Scanning Issues
 
 If BLE scanning fails:
@@ -342,6 +661,28 @@ tail -f ble_monitor.log
 # System service logs
 sudo journalctl -u ble-monitor.service -f
 ```
+
+### mariadb will not start
+
+# Check for running MariaDB processes
+ps aux | grep -i maria
+ps aux | grep -i mysql
+
+# Kill any stray processes (use the PIDs you see)
+sudo killall mariadbd
+sudo killall mysqld
+
+# Remove stale lock/pid files
+sudo rm -f /var/lib/mysql/*.pid
+sudo rm -f /var/run/mysqld/*.pid
+sudo rm -f /var/run/mysqld/mysqld.sock
+
+# Now start the service
+sudo systemctl start mariadb
+
+# Check status
+sudo systemctl status mariadb
+
 
 ## File Structure
 
