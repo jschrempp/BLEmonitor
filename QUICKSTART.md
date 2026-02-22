@@ -7,11 +7,17 @@
 # Run setup script
 ./setup.sh
 
-# Edit configuration
-nano config.ini
-
 # Create database (on MySQL server)
 mysql -u root -p < schema.sql
+
+# Create database user
+create user 'ble_user'@'localhost' identified by 'MAKE A PASSWORD';
+
+# Grant user permissions
+grant all privileges on ble_monitor.* to 'ble_user'@'localhost';
+
+# Edit configuration
+nano config.ini
 
 # Test database connection
 python3 test_db.py
@@ -138,6 +144,10 @@ sudo systemctl status bluetooth
 
 # Restart Bluetooth
 sudo systemctl restart bluetooth
+
+# bring bluetooth up
+sudo rfkill unblock bluetooth
+sudo hciconfig hci0 up
 
 # List BLE adapters
 hciconfig
