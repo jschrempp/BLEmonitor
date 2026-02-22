@@ -1,0 +1,15 @@
+# Local runtime/config files
+config.ini
+ble_monitor.log
+
+# Local backup/experiment files
+*.backup
+ble_monitor_old_standalone.py
+
+# Virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
