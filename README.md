@@ -65,6 +65,33 @@ When multiple monitors detect the same device during a 5-minute interval, the sy
 
 This ensures accurate location tracking (closest monitor) and prevents duplicate data.
 
+### Processor Role (Multi-Monitor Coordination)
+
+**Problem**: When multiple monitors run independently, they can't all process intervals simultaneously without conflicts.
+
+**Solution**: Only ONE monitor is designated as the "processor" - it's the only one that runs `process_interval_best_rssi()`.
+
+**How it works:**
+
+1. **Configuration**: Set `process_intervals = true` in config.ini for ONLY ONE monitor
+2. **Startup**: The designated monitor attempts to claim the processor role:
+   - Checks if another monitor already claimed it (within last 10 minutes)
+   - Fails to start if another active processor exists
+   - Claims the role if no active processor or stale claim (>10 min old)
+3. **Operation**: 
+   - **Processor monitor**: Scans → writes to staging → waits 60s → processes interval → repeats
+   - **Non-processor monitors**: Scans → writes to staging → repeats (no processing)
+4. **Heartbeat**: Processor updates its claim timestamp every cycle to show it's alive
+5. **Failover**: If processor monitor dies (no heartbeat for 10+ minutes), another monitor configured with `process_intervals=true` can take over
+
+**Benefits:**
+- ✅ Prevents race conditions and duplicate processing
+- ✅ Wait period (60s) ensures all monitors finish scanning before processing
+- ✅ Automatic failover if processor monitor fails
+- ✅ Clear error messages if multiple processors configured incorrectly
+
+**Important**: Only configure ONE monitor with `process_intervals = true` to avoid conflicts!
+
 ### Data Flow Diagram
 
 ```
@@ -79,6 +106,7 @@ This ensures accurate location tracking (closest monitor) and prevents duplicate
         │     - Connect to database                │
         │     - Create/update monitor record       │
         │     - Get monitor_id                     │
+        │     - Try claim processor role (if cfg)  │
         └─────────────────────────────────────────┘
                               │
                               ▼
@@ -98,40 +126,65 @@ This ensures accurate location tracking (closest monitor) and prevents duplicate
         ┌─────────────────────────────────────────┐
         │  4. Write to Staging Table               │
         │     INSERT INTO sighting_staging         │
-        │     (All readings from this monitor)     │
+        │     (ALL monitors do this)               │
         └─────────────────────────────────────────┘
+                              │
+                   ┌──────────┴──────────┐
+                   │                     │
+           Is Processor?             Is Processor?
+               NO                        YES
+                   │                     │
+                   ▼                     ▼
+        ┌──────────────────┐  ┌─────────────────────────┐
+        │  Skip Processing  │  │  5. Wait 60 seconds     │
+        │  (Scanner only)   │  │  (for other monitors)   │
+        └──────────────────┘  └─────────────────────────┘
+                   │                     │
+                   │                     ▼
+                   │          ┌─────────────────────────┐
+                   │          │  6. Ensure Devices Exist│
+                   │          │  INSERT INTO ble_devices│
+                   │          └─────────────────────────┘
+                   │                     │
+                   │                     ▼
+                   │          ┌─────────────────────────┐
+                   │          │  7. Process Best RSSI   │
+                   │          │  CALL process_interval   │
+                   │          │  _best_rssi()            │
+                   │          │  - Group by device       │
+                   │          │  - SELECT MAX(rssi)      │
+                   │          │  - INSERT device_sightings│
+                   │          │  - Mark staging processed│
+                   │          └─────────────────────────┘
+                   │                     │
+                   │                     ▼
+                   │          ┌─────────────────────────┐
+                   │          │  8. Refresh processor   │
+                   │          │     claim (heartbeat)    │
+                   │          └─────────────────────────┘
+                   │                     │
+                   └──────────┬──────────┘
                               │
                               ▼
         ┌─────────────────────────────────────────┐
-        │  5. Ensure Devices Exist                 │
-        │     INSERT INTO ble_devices              │
-        │     ON DUPLICATE KEY UPDATE              │
-        └─────────────────────────────────────────┘
-                              │
-                              ▼
-        ┌─────────────────────────────────────────┐
-        │  6. Process Best RSSI Selection          │
-        │     CALL process_interval_best_rssi()    │
-        │     - Group by device + interval         │
-        │     - SELECT MAX(rssi)                   │
-        │     - INSERT INTO device_sightings       │
-        │     - Mark staging records as processed  │
-        └─────────────────────────────────────────┘
-                              │
-                              ▼
-        ┌─────────────────────────────────────────┐
-        │  7. Sleep Until Next Interval            │
-        │     (300 seconds - scan duration)        │
+        │  9. Sleep Until Next Interval            │
+        │     (Processor: 300s - scan - 60s wait) │
+        │     (Scanner: 300s - scan)               │
         └─────────────────────────────────────────┘
                               │
                               └──────► Loop back to step 2
 ```
 
 **Database Tables Interaction:**
-- `monitors` ← Monitor registers/updates itself
-- `sighting_staging` ← Raw scan data from all monitors
-- `ble_devices` ← Device catalog (auto-created)
-- `device_sightings` ← Final deduplicated data (best RSSI)
+- `monitors` ← Monitor registers/updates itself, processor claims role
+- `sighting_staging` ← Raw scan data from ALL monitors
+- `ble_devices` ← Device catalog (auto-created by processor)
+- `device_sightings` ← Final deduplicated data (best RSSI, written by processor)
+
+**Key Points:**
+- ALL monitors write to `sighting_staging`
+- ONLY the processor monitor runs `process_interval_best_rssi()`
+- Processor waits 60s to ensure all monitors finish scanning before processing
 
 ## Requirements
 
@@ -219,6 +272,8 @@ name = RPi_Monitor_01              # UNIQUE name for each monitor
 location = Living Room              # Physical location
 scan_interval_seconds = 300         # 5 minutes
 scan_duration_seconds = 10          # How long each scan takes
+process_intervals = false           # IMPORTANT: Only ONE monitor should be 'true'
+processor_wait_seconds = 60         # Wait time before processing (if processor)
 
 [database]
 host = localhost                    # MySQL server IP/hostname
@@ -228,7 +283,14 @@ password = your_password
 database = ble_monitor
 ```
 
-**Important**: Each monitor must have a unique `name` in the config file!
+**Important Configuration Notes:**
+
+1. **Each monitor must have a unique `name`** in the config file
+2. **Only ONE monitor should have `process_intervals = true`**
+   - This monitor processes intervals (selects best RSSI)
+   - It waits 60 seconds after scanning for other monitors to finish
+   - All other monitors should have `process_intervals = false`
+3. If you accidentally configure multiple monitors with `process_intervals = true`, the second one will fail to start with an error message
 
 ### 7. Test the Installation
 
@@ -472,23 +534,42 @@ To set up multiple Raspberry Pi monitors:
 1. Install the application on each RPi following the installation steps
 2. Ensure each monitor has a **unique name** in `config.ini`
 3. Configure all monitors to connect to the **same MySQL database**
-4. Start the monitor service on each device
+4. **Designate ONE monitor as the processor** (set `process_intervals = true`)
+5. Set all other monitors with `process_intervals = false`
+6. Start the monitor service on each device
 
 Example configurations:
 
-**Monitor 1 (Living Room)**:
+**Monitor 1 (Living Room) - Processor**:
 ```ini
 [monitor]
 name = RPi_Monitor_LivingRoom
 location = Living Room
+process_intervals = true          # This monitor processes intervals
+processor_wait_seconds = 60
 ```
 
-**Monitor 2 (Bedroom)**:
+**Monitor 2 (Bedroom) - Scanner Only**:
 ```ini
 [monitor]
 name = RPi_Monitor_Bedroom
 location = Bedroom
+process_intervals = false         # This monitor only scans
 ```
+
+**Monitor 3 (Kitchen) - Scanner Only**:
+```ini
+[monitor]
+name = RPi_Monitor_Kitchen
+location = Kitchen
+process_intervals = false         # This monitor only scans
+```
+
+**How it works:**
+- **All monitors** scan for BLE devices and write to the staging table
+- **Only the processor monitor** (Living Room in this example) runs the stored procedure to select best RSSI
+- The processor waits 60 seconds after scanning to ensure other monitors finish before processing
+- If the processor monitor fails, you can start another monitor with `process_intervals = true` to take over
 
 The system will automatically select the best RSSI reading per device per interval across all monitors.
 
@@ -531,6 +612,50 @@ WHERE interval_start < DATE_SUB(NOW(), INTERVAL 90 DAY);
 ## Troubleshooting
 
 ### Monitor and Database Writer Issues
+
+**Problem: "Another monitor is already the interval processor" error**
+This means you have two monitors configured with `process_intervals = true`. Only ONE monitor can be the processor.
+
+```bash
+# Solution 1: Fix config on the second monitor
+nano config.ini
+# Change: process_intervals = false
+
+# Solution 2: Check which monitor is the processor
+mysql -u ble_user -p ble_monitor -e "
+SELECT monitor_name, is_processor, processor_claimed_at 
+FROM monitors 
+WHERE is_processor = TRUE;"
+
+# Solution 3: If the processor monitor is dead, clear stale claim
+mysql -u ble_user -p ble_monitor -e "
+UPDATE monitors 
+SET is_processor = FALSE, processor_claimed_at = NULL 
+WHERE processor_claimed_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE);"
+```
+
+**Problem: Intervals not being processed (data stays in staging)**
+Check if any monitor is configured as processor:
+
+```bash
+# Check processor status
+mysql -u ble_user -p ble_monitor -e "
+SELECT monitor_name, is_processor, processor_claimed_at, last_seen
+FROM monitors;"
+
+# Check staging table for unprocessed data
+mysql -u ble_user -p ble_monitor -e "
+SELECT interval_start, processed, COUNT(*) 
+FROM sighting_staging 
+GROUP BY interval_start, processed 
+ORDER BY interval_start DESC 
+LIMIT 10;"
+
+# Solution: Ensure ONE monitor has process_intervals = true
+nano config.ini
+# Set: process_intervals = true
+# Then restart that monitor
+```
 
 **Problem: Monitor fails to start**
 ```bash

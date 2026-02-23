@@ -17,6 +17,14 @@ scan_interval_seconds = 300
 # Duration of each BLE scan in seconds
 scan_duration_seconds = 10
 
+# Interval processing (IMPORTANT: Only ONE monitor should have this set to true)
+# The processor monitor runs the stored procedure to select best RSSI per interval
+process_intervals = false
+
+# Wait time in seconds before processing intervals (allows other monitors to finish)
+# Only used if process_intervals = true
+processor_wait_seconds = 60
+
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level = INFO
 

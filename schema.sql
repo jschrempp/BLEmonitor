@@ -15,8 +15,11 @@ CREATE TABLE IF NOT EXISTS monitors (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     is_active BOOLEAN DEFAULT TRUE,
+    is_processor BOOLEAN DEFAULT FALSE,
+    processor_claimed_at TIMESTAMP NULL,
     INDEX idx_monitor_name (monitor_name),
-    INDEX idx_active (is_active)
+    INDEX idx_active (is_active),
+    INDEX idx_processor (is_processor, processor_claimed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- BLE Devices table: tracks discovered BLE devices

@@ -36,6 +36,7 @@ class BLEMonitor:
         self.monitor_name = self.config['monitor']['name']
         self.scan_interval = int(self.config['monitor']['scan_interval_seconds'])
         self.scan_duration = int(self.config['monitor']['scan_duration_seconds'])
+        self.is_processor = False  # Will be set during startup if configured
         self.db_config = {
             'host': self.config['database']['host'],
             'port': int(self.config['database']['port']),
@@ -114,6 +115,106 @@ class BLEMonitor:
         except Error as e:
             self.logger.error(f"Error registering monitor: {e}")
             raise
+    
+    def _try_claim_processor_role(self) -> bool:
+        """Try to claim the interval processor role. Returns True if successful."""
+        if not self.config['monitor'].getboolean('process_intervals', False):
+            self.logger.info("This monitor is not configured to process intervals")
+            return False
+        
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            
+            # Check for existing active processor (claimed within last 10 minutes)
+            cursor.execute("""
+                SELECT monitor_name, processor_claimed_at 
+                FROM monitors 
+                WHERE is_processor = TRUE 
+                AND processor_claimed_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+                AND monitor_name != %s
+            """, (self.monitor_name,))
+            
+            existing = cursor.fetchone()
+            
+            if existing:
+                self.logger.error(
+                    f"Another monitor '{existing[0]}' is already the interval processor "
+                    f"(claimed at {existing[1]}). Only ONE monitor can process intervals. "
+                    f"Please set process_intervals=false in config.ini or stop the other processor."
+                )
+                cursor.close()
+                conn.close()
+                return False
+            
+            # Clear any stale processor claims (older than 10 minutes = dead processor)
+            cursor.execute("""
+                UPDATE monitors 
+                SET is_processor = FALSE, processor_claimed_at = NULL
+                WHERE is_processor = TRUE 
+                AND (processor_claimed_at IS NULL OR processor_claimed_at <= DATE_SUB(NOW(), INTERVAL 10 MINUTE))
+            """)
+            
+            if cursor.rowcount > 0:
+                self.logger.warning(f"Cleared {cursor.rowcount} stale processor claim(s)")
+            
+            # Claim processor role for this monitor
+            cursor.execute("""
+                UPDATE monitors 
+                SET is_processor = TRUE, processor_claimed_at = NOW()
+                WHERE monitor_name = %s
+            """, (self.monitor_name,))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            self.logger.info(f"✓ Successfully claimed interval processor role")
+            return True
+            
+        except Error as e:
+            self.logger.error(f"Error claiming processor role: {e}")
+            return False
+    
+    def _refresh_processor_claim(self):
+        """Refresh processor claim timestamp (heartbeat) to show we're still active"""
+        if not self.is_processor:
+            return
+        
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE monitors 
+                SET processor_claimed_at = NOW()
+                WHERE monitor_name = %s AND is_processor = TRUE
+            """, (self.monitor_name,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            self.logger.debug("Refreshed processor claim timestamp")
+        except Error as e:
+            self.logger.warning(f"Error refreshing processor claim: {e}")
+    
+    def _release_processor_role(self):
+        """Release the processor role (called on shutdown)"""
+        if not self.is_processor:
+            return
+        
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE monitors 
+                SET is_processor = FALSE, processor_claimed_at = NULL
+                WHERE monitor_name = %s
+            """, (self.monitor_name,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            self.logger.info("Released interval processor role")
+        except Error as e:
+            self.logger.warning(f"Error releasing processor role: {e}")
     
     def _get_interval_start(self) -> datetime:
         """Get the start of the current 5-minute interval"""
@@ -253,11 +354,23 @@ class BLEMonitor:
         devices = self.scan_ble_devices_sync()
         
         if devices:
-            # Store in staging table
+            # Store in staging table (ALL monitors do this)
             self._store_sightings_staging(devices, interval_start)
             
-            # Process the interval to select best RSSI
-            self._process_interval(interval_start)
+            # Only the designated processor runs the stored procedure
+            if self.is_processor:
+                # Wait for other monitors to finish their scans and writes
+                wait_time = int(self.config['monitor'].get('processor_wait_seconds', 60))
+                self.logger.info(f"Processor: waiting {wait_time}s for other monitors to complete their scans...")
+                time.sleep(wait_time)
+                
+                # Now process the interval to select best RSSI
+                self._process_interval(interval_start)
+                
+                # Refresh our processor claim heartbeat
+                self._refresh_processor_claim()
+            else:
+                self.logger.debug("Not processor - skipping interval processing")
         else:
             self.logger.warning("No devices found in this scan")
     
@@ -270,39 +383,58 @@ class BLEMonitor:
         # Register monitor
         self.monitor_id = self._register_monitor()
         
-        while True:
-            try:
-                cycle_start = time.time()
-                
-                # Run scan cycle
-                self.run_scan_cycle()
-                
-                # Calculate sleep time to maintain interval
-                cycle_duration = time.time() - cycle_start
-                sleep_time = max(0, self.scan_interval - cycle_duration)
-                
-                if sleep_time > 0:
-                    self.logger.info(f"Sleeping for {sleep_time:.1f} seconds until next scan")
-                    time.sleep(sleep_time)
-                else:
-                    self.logger.warning(f"Scan cycle took longer than interval ({cycle_duration:.1f}s)")
-                
-            except KeyboardInterrupt:
-                self.logger.info("Received shutdown signal")
-                break
-            except Exception as e:
-                self.logger.error(f"Error in scan cycle: {e}", exc_info=True)
-                self.logger.info("Waiting 60 seconds before retry...")
-                time.sleep(60)
+        # Try to claim processor role if configured
+        self.is_processor = self._try_claim_processor_role()
         
-        self.logger.info("BLE Monitor stopped")
+        if self.is_processor:
+            self.logger.info("This monitor will process intervals (select best RSSI)")
+        else:
+            self.logger.info("This monitor will only scan and write to staging table")
+        
+        try:
+            while True:
+                try:
+                    cycle_start = time.time()
+                    
+                    # Run scan cycle
+                    self.run_scan_cycle()
+                    
+                    # Calculate sleep time to maintain interval
+                    cycle_duration = time.time() - cycle_start
+                    sleep_time = max(0, self.scan_interval - cycle_duration)
+                    
+                    if sleep_time > 0:
+                        self.logger.info(f"Sleeping for {sleep_time:.1f} seconds until next scan")
+                        time.sleep(sleep_time)
+                    else:
+                        self.logger.warning(f"Scan cycle took longer than interval ({cycle_duration:.1f}s)")
+                    
+                except KeyboardInterrupt:
+                    self.logger.info("Received shutdown signal")
+                    break
+                except Exception as e:
+                    self.logger.error(f"Error in scan cycle: {e}", exc_info=True)
+                    self.logger.info("Waiting 60 seconds before retry...")
+                    time.sleep(60)
+        finally:
+            # Always release processor role on shutdown
+            self._release_processor_role()
+            self.logger.info("BLE Monitor stopped")
     
     def run_single_scan(self):
         """Run a single scan (useful for testing)"""
         self.logger.info("Running single scan mode")
         self.monitor_id = self._register_monitor()
-        self.run_scan_cycle()
-        self.logger.info("Single scan complete")
+        
+        # Try to claim processor role if configured
+        self.is_processor = self._try_claim_processor_role()
+        
+        try:
+            self.run_scan_cycle()
+        finally:
+            # Release processor role
+            self._release_processor_role()
+            self.logger.info("Single scan complete")
 
 
 def main():
