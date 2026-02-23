@@ -209,6 +209,13 @@ sudo apt upgrade -y
 # Install Bluetooth tools
 sudo apt install -y bluetooth bluez libbluetooth-dev
 
+# Enable Bluetooth if blocked by RF-kill
+sudo rfkill unblock bluetooth
+sudo hciconfig hci0 up
+
+# Verify Bluetooth is working
+hciconfig
+
 # Install MySQL client (if database is remote)
 sudo apt install -y default-mysql-client
 
@@ -249,6 +256,36 @@ CREATE DATABASE ble_monitor;
 CREATE USER 'ble_user'@'%' IDENTIFIED BY 'your_password';
 GRANT ALL PRIVILEGES ON ble_monitor.* TO 'ble_user'@'%';
 FLUSH PRIVILEGES;
+```
+
+**Configure MariaDB/MySQL for Remote Access** (required for multiple monitors):
+
+```bash
+# Edit MariaDB configuration
+sudo nano /etc/mysql/mariadb.conf.d/50-server.cnf
+```
+
+Find and change the bind-address:
+```ini
+# Change this:
+bind-address = 127.0.0.1
+
+# To this (listen on all interfaces):
+bind-address = 0.0.0.0
+```
+
+Restart MariaDB and verify:
+```bash
+# Restart the service
+sudo systemctl restart mariadb
+
+# Verify it's listening on all interfaces (should show 0.0.0.0:3306)
+sudo netstat -tlnp | grep 3306
+
+# If you have a firewall, allow MySQL port
+sudo ufw allow 3306/tcp
+# Or allow only from your local network (more secure):
+sudo ufw allow from 192.168.0.0/16 to any port 3306
 ```
 
 Import the schema:
@@ -769,9 +806,65 @@ sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f $(which python3))
 
 ### Database Connection Issues
 
+**Problem: "Can't connect to MySQL server" (Error 2003 or 111)**
+
+This usually means MariaDB is only listening on localhost, not accepting remote connections.
+
+```bash
+# On MySQL server, check what interface it's listening on
+sudo netstat -tlnp | grep 3306
+
+# If you see 127.0.0.1:3306 (BAD - localhost only):
+tcp        0      0 127.0.0.1:3306          0.0.0.0:*               LISTEN
+
+# You need 0.0.0.0:3306 (GOOD - all interfaces):
+tcp        0      0 0.0.0.0:3306            0.0.0.0:*               LISTEN
+```
+
+**Solution:**
+```bash
+# Edit MariaDB config
+sudo nano /etc/mysql/mariadb.conf.d/50-server.cnf
+
+# Change:
+bind-address = 127.0.0.1
+# To:
+bind-address = 0.0.0.0
+
+# Restart
+sudo systemctl restart mariadb
+
+# Verify
+sudo netstat -tlnp | grep 3306
+
+# Check firewall
+sudo ufw allow 3306/tcp
+```
+
+**Problem: "Access denied for user"**
+
+User may not have remote access permissions.
+
+```sql
+-- On MySQL server
+mysql -u root -p
+
+-- Check user permissions
+SELECT user, host FROM mysql.user WHERE user = 'ble_user';
+
+-- Grant remote access (% = any host)
+CREATE USER 'ble_user'@'%' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON ble_monitor.* TO 'ble_user'@'%';
+FLUSH PRIVILEGES;
+```
+
+**Test connection from remote monitor:**
 ```bash
 # Test MySQL connection
 mysql -h <host> -u ble_user -p ble_monitor
+
+# Test port connectivity
+telnet <host> 3306
 
 # Check if MySQL service is running
 sudo systemctl status mysql
